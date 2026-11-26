@@ -1,0 +1,510 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Player = Players.LocalPlayer
+
+--// RAYFIELD (loaded first so Notify works)
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+--// REMOTES
+local Remotes = ReplicatedStorage
+    :WaitForChild("Shared")
+    :WaitForChild("Net")
+    :WaitForChild("Remotes")
+
+local RollRemote = Remotes:WaitForChild("Roll")
+local RollResultRemote = Remotes:WaitForChild("RollResult")
+local UnitBoughtRemote = Remotes:WaitForChild("UnitBought")
+
+--// SETTINGS
+local TargetName = "Goju"
+local TargetRarity = "Secret"
+
+local AutoRoll = false
+local AutoFirePrompt = true
+
+local RollDelay = 1
+local PromptDelay = 0.2        -- wait after teleport, before activating prompt
+local MaxPromptAttempts = 5    -- retries if UnitBought doesn't arrive
+local RetryInterval = 1        -- seconds between prompt attempts
+
+local MutationSettings = {
+    Raijin = true,
+    Honored = true,
+    Apostle = true,
+    Cursed = true,
+    Hollow = true,
+    Godspeed = true
+}
+
+--// STATE
+local SavedPositions = {
+    [1] = nil,
+    [2] = nil,
+    [3] = nil
+}
+
+local Busy = false          -- true = rolling is paused while handling a target
+local PendingTarget = nil   -- target we are waiting to be purchased
+
+--// CHARACTER
+local function GetRoot()
+    local Character = Player.Character
+    return Character and Character:FindFirstChild("HumanoidRootPart")
+end
+
+--// NOTIFICATION
+local function Notify(Title, Content)
+    Rayfield:Notify({
+        Title = Title,
+        Content = Content,
+        Duration = 4
+    })
+end
+
+--// POSITION
+local function SavePosition(Index)
+    local Root = GetRoot()
+
+    if not Root then
+        Notify("Position", "Character not found.")
+        return
+    end
+
+    SavedPositions[Index] = Root.CFrame
+
+    Notify("Position Saved", "Summoner position " .. Index .. " saved.")
+end
+
+local function TeleportToPosition(Index)
+    local Root = GetRoot()
+    local Position = SavedPositions[Index]
+
+    if not Root then
+        Notify("Teleport", "Character not found.")
+        return false
+    end
+
+    if not Position then
+        Notify("Teleport", "Position " .. Index .. " has not been saved.")
+        return false
+    end
+
+    Root.CFrame = Position
+    return true
+end
+
+--// PROMPT POSITION
+local function GetPromptPosition(Prompt)
+    local Parent = Prompt.Parent
+
+    if not Parent then
+        return nil
+    end
+
+    if Parent:IsA("Attachment") then
+        return Parent.WorldPosition
+    end
+
+    if Parent:IsA("BasePart") then
+        return Parent.Position
+    end
+
+    if Parent:IsA("Model") and Parent.PrimaryPart then
+        return Parent.PrimaryPart.Position
+    end
+
+    return nil
+end
+
+--// FIND NEAREST ENABLED PROMPT
+local function FindNearestPrompt()
+    local Root = GetRoot()
+
+    if not Root then
+        return nil
+    end
+
+    local NearestPrompt = nil
+    local NearestDistance = math.huge
+
+    for _, Object in ipairs(workspace:GetDescendants()) do
+        if Object:IsA("ProximityPrompt") and Object.Enabled then
+            local Position = GetPromptPosition(Object)
+
+            if Position then
+                local Distance = (Root.Position - Position).Magnitude
+
+                if Distance <= Object.MaxActivationDistance
+                    and Distance < NearestDistance then
+
+                    NearestDistance = Distance
+                    NearestPrompt = Object
+                end
+            end
+        end
+    end
+
+    return NearestPrompt, NearestDistance
+end
+
+--// FIRE A PROMPT (executor function with fallback)
+local function FirePrompt(Prompt)
+    if fireproximityprompt then
+        fireproximityprompt(Prompt)
+    else
+        Prompt:InputHoldBegin()
+        task.wait(math.max(Prompt.HoldDuration, 0.05))
+        Prompt:InputHoldEnd()
+    end
+end
+
+--// ACTIVATE NEAREST PROMPT
+local function ActivateNearestPrompt()
+    local Prompt, Distance = FindNearestPrompt()
+
+    if not Prompt then
+        Notify("Prompt", "No enabled prompt within activation range.")
+        return false
+    end
+
+    Notify(
+        "Prompt Found",
+        Prompt:GetFullName() ..
+        "\nDistance: " .. math.floor(Distance) .. " studs"
+    )
+
+    local Success, ErrorMessage = pcall(function()
+        FirePrompt(Prompt)
+    end)
+
+    if not Success then
+        Notify("Prompt Error", tostring(ErrorMessage))
+        return false
+    end
+
+    return true
+end
+
+--// MUTATION FILTER
+local function IsMutationAllowed(Mutation)
+    return MutationSettings[Mutation] == true
+end
+
+--// RESUME ROLLING
+local function ResumeRolling(Reason)
+    Busy = false
+    PendingTarget = nil
+
+    if AutoRoll then
+        Notify("Auto Roll", Reason or "Resuming roll sequence.")
+    end
+end
+
+--// HANDLE A FOUND TARGET
+local function HandleTarget(Target)
+    -- Teleport to saved position for this index
+    TeleportToPosition(Target.Index)
+
+    -- Wait 0.2 seconds
+    task.wait(PromptDelay)
+
+    if not AutoFirePrompt then
+        Notify("Waiting", "Auto Fire is off. Activate the prompt manually.")
+
+        while Busy and PendingTarget == Target do
+            task.wait(0.1)
+        end
+
+        return
+    end
+
+    -- Find nearest enabled prompt, activate it, wait for UnitBought
+    local Attempts = 0
+
+    while Busy and PendingTarget == Target and Attempts < MaxPromptAttempts do
+        Attempts = Attempts + 1
+
+        ActivateNearestPrompt()
+
+        local Started = os.clock()
+
+        while Busy
+            and PendingTarget == Target
+            and os.clock() - Started < RetryInterval do
+
+            task.wait(0.1)
+        end
+    end
+
+    -- Still pending after all attempts -> give up and resume
+    if Busy and PendingTarget == Target then
+        Notify("Timeout", "Purchase was not confirmed.")
+        ResumeRolling("Resuming roll sequence after timeout.")
+    end
+end
+
+--// ROLL RESULT HANDLER
+local function ProcessRollResults(Results)
+    -- Already handling a target: ignore further results
+    if Busy then
+        return
+    end
+
+    if typeof(Results) ~= "table" then
+        return
+    end
+
+    for _, Item in ipairs(Results) do
+        if typeof(Item) == "table" then
+            local Name = Item.Name
+            local Rarity = Item.Rarity
+            local Mutation = Item.Mutation
+            local Index = tonumber(Item.Index)
+
+            -- Goju + Secret + accepted mutation?
+            if Name == TargetName
+                and Rarity == TargetRarity
+                and IsMutationAllowed(Mutation) then
+
+                if not Index or not SavedPositions[Index] then
+                    Notify(
+                        "Target Skipped",
+                        Name .. " | " .. tostring(Mutation) ..
+                        "\nNo saved position for index " .. tostring(Index)
+                    )
+                    -- continue rolling
+                else
+                    -- Pause rolling
+                    Busy = true
+
+                    local Target = {
+                        Name = Name,
+                        Mutation = Mutation,
+                        Index = Index
+                    }
+
+                    PendingTarget = Target
+
+                    Notify(
+                        "TARGET FOUND",
+                        Name .. " | " .. Mutation .. " | Index " .. Index
+                    )
+
+                    task.spawn(HandleTarget, Target)
+                    return
+                end
+            end
+        end
+    end
+    -- No match: rolling simply continues
+end
+
+--// ROLL RESULT CONNECTION
+RollResultRemote.OnClientEvent:Connect(function(Results, ...)
+    ProcessRollResults(Results)
+end)
+
+--// PURCHASE CONFIRMATION
+UnitBoughtRemote.OnClientEvent:Connect(function(Name, Mutation, ...)
+    if not Busy or not PendingTarget then
+        return
+    end
+
+    -- Verify Name + Mutation
+    if Name == PendingTarget.Name
+        and Mutation == PendingTarget.Mutation then
+
+        Notify("Purchase Confirmed", Name .. " | " .. Mutation)
+
+        -- Resume rolling
+        ResumeRolling()
+    end
+end)
+
+--// AUTO ROLL LOOP
+task.spawn(function()
+    while task.wait(0.05) do
+        if AutoRoll and not Busy then
+            local Success, ErrorMessage = pcall(function()
+                RollRemote:FireServer()
+            end)
+
+            if not Success then
+                warn("[Goju Automation] Roll error:", ErrorMessage)
+            end
+
+            task.wait(RollDelay)
+        end
+    end
+end)
+
+--// WINDOW
+local Window = Rayfield:CreateWindow({
+    Name = "Goju Summoner Automation",
+    LoadingTitle = "Goju Summoner",
+    LoadingSubtitle = "Roll and Prompt Controller",
+    ConfigurationSaving = {
+        Enabled = false
+    },
+    KeySystem = false
+})
+
+--// POSITIONS TAB
+local PositionTab = Window:CreateTab("Positions", 4483362458)
+
+for Index = 1, 3 do
+    local CurrentIndex = Index
+
+    PositionTab:CreateButton({
+        Name = "Save Summoner Position " .. CurrentIndex,
+        Callback = function()
+            SavePosition(CurrentIndex)
+        end
+    })
+
+    PositionTab:CreateButton({
+        Name = "Teleport to Position " .. CurrentIndex,
+        Callback = function()
+            TeleportToPosition(CurrentIndex)
+        end
+    })
+end
+
+--// ROLL TAB
+local RollTab = Window:CreateTab("Auto Roll", 4483362458)
+
+RollTab:CreateToggle({
+    Name = "Auto Roll",
+    CurrentValue = false,
+    Callback = function(Value)
+        AutoRoll = Value
+        Notify("Auto Roll", Value and "Enabled" or "Disabled")
+    end
+})
+
+RollTab:CreateSlider({
+    Name = "Roll Delay",
+    Range = {0.2, 10},
+    Increment = 0.1,
+    Suffix = " seconds",
+    CurrentValue = 1,
+    Callback = function(Value)
+        RollDelay = Value
+    end
+})
+
+RollTab:CreateInput({
+    Name = "Target Name",
+    CurrentValue = "Goju",
+    PlaceholderText = "Unit name",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(Value)
+        TargetName = Value
+    end
+})
+
+RollTab:CreateInput({
+    Name = "Target Rarity",
+    CurrentValue = "Secret",
+    PlaceholderText = "Rarity",
+    RemoveTextAfterFocusLost = false,
+    Callback = function(Value)
+        TargetRarity = Value
+    end
+})
+
+--// MUTATION TAB
+local MutationTab = Window:CreateTab("Mutations", 4483362458)
+
+for Mutation, Enabled in pairs(MutationSettings) do
+    local CurrentMutation = Mutation
+
+    MutationTab:CreateToggle({
+        Name = CurrentMutation,
+        CurrentValue = Enabled,
+        Callback = function(Value)
+            MutationSettings[CurrentMutation] = Value
+        end
+    })
+end
+
+--// PROMPT TAB
+local PromptTab = Window:CreateTab("ProximityPrompt", 4483362458)
+
+PromptTab:CreateToggle({
+    Name = "Auto Fire Prompt After Teleport",
+    CurrentValue = true,
+    Callback = function(Value)
+        AutoFirePrompt = Value
+        Notify("Auto Fire Prompt", Value and "Enabled" or "Disabled")
+    end
+})
+
+PromptTab:CreateSlider({
+    Name = "Wait After Teleport",
+    Range = {0.05, 3},
+    Increment = 0.05,
+    Suffix = " seconds",
+    CurrentValue = 0.2,
+    Callback = function(Value)
+        PromptDelay = Value
+    end
+})
+
+PromptTab:CreateButton({
+    Name = "Find Nearest Prompt",
+    Callback = function()
+        local Prompt, Distance = FindNearestPrompt()
+
+        if Prompt then
+            Notify(
+                "Nearest Prompt",
+                Prompt:GetFullName() ..
+                "\nDistance: " .. math.floor(Distance) .. " studs"
+            )
+        else
+            Notify("Nearest Prompt", "No prompt in activation range.")
+        end
+    end
+})
+
+PromptTab:CreateButton({
+    Name = "Test Prompt Activation",
+    Callback = function()
+        ActivateNearestPrompt()
+    end
+})
+
+--// STATUS TAB
+local StatusTab = Window:CreateTab("Status", 4483362458)
+
+StatusTab:CreateButton({
+    Name = "Show Current Status",
+    Callback = function()
+        local Status = "Auto Roll: " .. tostring(AutoRoll)
+            .. "\nAuto Fire Prompt: " .. tostring(AutoFirePrompt)
+            .. "\nRolling Paused: " .. tostring(Busy)
+
+        if PendingTarget then
+            Status = Status ..
+                "\nTarget: " .. PendingTarget.Name ..
+                "\nMutation: " .. PendingTarget.Mutation ..
+                "\nIndex: " .. PendingTarget.Index
+        end
+
+        Notify("Automation Status", Status)
+    end
+})
+
+StatusTab:CreateButton({
+    Name = "Cancel Pending Target (Resume Rolling)",
+    Callback = function()
+        ResumeRolling("Pending target cancelled. Rolling resumed.")
+    end
+})
+
+Notify(
+    "Goju Summoner",
+    "Loaded successfully. Save your three summoner positions first."
+)
